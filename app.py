@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, render_template_string
 from flask_sqlalchemy import SQLAlchemy
 import requests
 import os
@@ -35,6 +35,7 @@ class Story(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     keywords = db.Column(db.String(500))  # 存储用户输入的关键词
     illustration_url = db.Column(db.String(500))  # 存储插图URL或文件路径
+    audio_url = db.Column(db.String(500))  # 存储音频URL或文件路径
 
     def to_dict(self):
         return {
@@ -44,7 +45,8 @@ class Story(db.Model):
             'content': self.content,
             'created_at': self.created_at.isoformat(),
             'keywords': self.keywords,
-            'illustration_url': self.illustration_url
+            'illustration_url': self.illustration_url,
+            'audio_url': self.audio_url
         }
 
 # 创建数据库表
@@ -56,6 +58,10 @@ with app.app_context():
     if 'story' in inspector.get_table_names() and 'illustration_url' not in inspector.get_columns('story'):
         # 添加新字段
         db.engine.execute('ALTER TABLE story ADD COLUMN illustration_url VARCHAR(500)')
+    # 检查audio_url字段是否存在
+    if 'story' in inspector.get_table_names() and 'audio_url' not in inspector.get_columns('story'):
+        # 添加新字段
+        db.engine.execute('ALTER TABLE story ADD COLUMN audio_url VARCHAR(500)')
     # 创建所有表（如果不存在）
     db.create_all()
 
@@ -110,6 +116,49 @@ def save_image(base64_image):
     image_data = base64.b64decode(base64_image)
     with open(filepath, 'wb') as f:
         f.write(image_data)
+    
+    # 返回相对路径
+    return f"/uploads/{filename}"
+
+# 调用百度语音合成API生成音频
+def generate_audio_with_baidu(text):
+    access_token = get_access_token()
+    url = f"https://tsn.baidu.com/text2audio?access_token={access_token}"
+    
+    # 构造请求参数
+    params = {
+        "tex": text,
+        "tok": access_token,
+        "cuid": "children_story_platform",
+        "ctp": 1,
+        "lan": "zh",
+        "spd": 5,  # 语速，取值0-9
+        "pit": 5,  # 语调，取值0-9
+        "vol": 5,  # 音量，取值0-9
+        "per": 0   # 发音人，0为女声，1为男声，3为情感合成-度逍遥，4为情感合成-度丫丫
+    }
+    
+    response = requests.get(url, params=params)
+    
+    # 检查响应是否为音频文件
+    if response.headers.get('Content-Type') == 'audio/mp3':
+        return response.content
+    else:
+        raise Exception(f"音频生成API调用失败: {response.text}")
+
+# 保存音频文件到本地
+def save_audio(audio_data):
+    # 确保uploads目录存在
+    if not os.path.exists(UPLOAD_FOLDER):
+        os.makedirs(UPLOAD_FOLDER)
+    
+    # 生成唯一文件名
+    filename = f"{uuid.uuid4().hex}.mp3"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    
+    # 保存音频文件
+    with open(filepath, 'wb') as f:
+        f.write(audio_data)
     
     # 返回相对路径
     return f"/uploads/{filename}"
@@ -246,8 +295,205 @@ def generate_illustration_for_story(story_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# 静态文件路由，用于访问上传的图片
+# 静态文件路由，用于访问上传的图片和音频
 @app.route('/uploads/<filename>')
+def serve_uploads(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+# API端点：为故事生成音频
+@app.route('/api/stories/<int:story_id>/generate-audio', methods=['POST'])
+def generate_audio_for_story(story_id):
+    try:
+        # 获取故事
+        story = Story.query.get_or_404(story_id)
+        
+        # 获取请求数据
+        data = request.json or {}
+        # 优先使用请求中的文本，如果没有则使用故事正文
+        text_for_audio = data.get('text', story.content)
+        
+        # 调用百度语音合成API生成音频
+        audio_data = generate_audio_with_baidu(text_for_audio)
+        
+        # 保存音频文件到本地
+        audio_url = save_audio(audio_data)
+        
+        # 更新故事记录
+        story.audio_url = audio_url
+        db.session.commit()
+        
+        return jsonify({
+            'message': '音频生成成功',
+            'story': story.to_dict()
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 简单的前端页面，用于播放故事音频
+@app.route('/play/<int:story_id>')
+def play_story(story_id):
+    story = Story.query.get_or_404(story_id)
+    
+    # 简单的HTML模板
+    html = '''
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{{ title }} - 故事播放器</title>
+        <style>
+            body {
+                font-family: 'Arial', sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .story-container {
+                background-color: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                text-align: center;
+            }
+            .summary {
+                font-style: italic;
+                color: #666;
+                margin-bottom: 20px;
+            }
+            .content {
+                line-height: 1.6;
+                color: #333;
+                margin-bottom: 30px;
+            }
+            .audio-player {
+                width: 100%;
+                margin-bottom: 20px;
+            }
+            .illustration {
+                max-width: 100%;
+                height: auto;
+                display: block;
+                margin: 20px auto;
+                border-radius: 8px;
+            }
+            .actions {
+                display: flex;
+                justify-content: center;
+                gap: 10px;
+                margin-top: 30px;
+            }
+            button {
+                padding: 10px 20px;
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 16px;
+            }
+            button:hover {
+                background-color: #45a049;
+            }
+            .keyword-tag {
+                display: inline-block;
+                background-color: #e0e0e0;
+                padding: 5px 10px;
+                border-radius: 15px;
+                margin-right: 5px;
+                font-size: 12px;
+            }
+            .keywords {
+                margin-top: 10px;
+                margin-bottom: 20px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="story-container">
+            <h1>{{ title }}</h1>
+            <div class="keywords">
+                {% for keyword in keywords %}
+                    <span class="keyword-tag">{{ keyword }}</span>
+                {% endfor %}
+            </div>
+            <div class="summary">{{ summary }}</div>
+            
+            {% if illustration_url %}
+                <img src="{{ illustration_url }}" alt="故事插图" class="illustration">
+            {% endif %}
+            
+            <div class="content">{{ content }}</div>
+            
+            {% if audio_url %}
+                <h3>音频播放</h3>
+                <audio controls class="audio-player">
+                    <source src="{{ audio_url }}" type="audio/mpeg">
+                    您的浏览器不支持音频播放。
+                </audio>
+            {% else %}
+                <div class="actions">
+                    <form id="generate-audio-form">
+                        <button type="submit">生成音频</button>
+                    </form>
+                </div>
+            {% endif %}
+        </div>
+        
+        <script>
+            // 生成音频的表单提交
+            document.getElementById('generate-audio-form')?.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const button = e.submitter;
+                const originalText = button.textContent;
+                button.textContent = '生成中...';
+                button.disabled = true;
+                
+                try {
+                    const response = await fetch('/api/stories/{{ story_id }}/generate-audio', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const data = await response.json();
+                    if (data.message) {
+                        alert(data.message);
+                        location.reload();
+                    } else {
+                        alert('生成失败: ' + (data.error || '未知错误'));
+                    }
+                } catch (error) {
+                    alert('请求失败: ' + error.message);
+                } finally {
+                    button.textContent = originalText;
+                    button.disabled = false;
+                }
+            });
+        </script>
+    </body>
+    </html>
+    '''
+    
+    # 准备模板数据
+    keywords = story.keywords.split(' ') if story.keywords else []
+    
+    # 渲染模板
+    return render_template_string(html, 
+        story_id=story.id,
+        title=story.title,
+        summary=story.summary,
+        content=story.content,
+        keywords=keywords,
+        illustration_url=story.illustration_url,
+        audio_url=story.audio_url
+    )
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
