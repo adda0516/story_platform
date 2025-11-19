@@ -1,0 +1,30 @@
+# 虚拟环境
+venv/
+env/
+*.pyc
+__pycache__/
+
+# 数据库文件
+*.db
+instance/
+
+# 上传的文件
+uploads/
+
+# 环境变量文件
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Windows文件
+Thumbs.db
+.DS_Store
